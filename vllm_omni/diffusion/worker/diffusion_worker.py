@@ -192,6 +192,13 @@ class DiffusionWorker:
         # requests, which only carry their request_id in subsequent ticks.
         self._step_lora_state: dict[str, tuple[LoRARequest | None, float]] = {}
         self.stage_id = getattr(od_config, "stage_id", 0)
+        # Optional pipeline-supplied NPU-side post-process hook. When set,
+        # generate() runs it on the still-on-NPU output before return_result
+        # triggers SHM pack — see
+        # vllm_omni.diffusion.registry._DIFFUSION_WORKER_POSTPROCESS_FUNCS.
+        from vllm_omni.diffusion.registry import get_diffusion_worker_postprocess_func
+
+        self._worker_postprocess_func = get_diffusion_worker_postprocess_func(od_config)
         self.init_device()
         # Create model runner using the platform-specified class
         model_runner_cls_path = current_omni_platform.get_diffusion_model_runner_cls()
@@ -328,8 +335,26 @@ class DiffusionWorker:
         )
 
     def generate(self, request: OmniDiffusionRequest) -> DiffusionOutput:
-        """Generate output for the given requests."""
-        return self.execute_model(request, self.od_config)
+        """Generate output for the given requests.
+
+        If the pipeline registered a worker-side post-process function via
+        ``_DIFFUSION_WORKER_POSTPROCESS_FUNCS``, run it on the still-on-accelerator
+        output before ``return_result`` triggers the single d2h required for
+        SHM packing. This avoids an engine round-trip that an explicit
+        ``collective_rpc`` dispatch would otherwise force for steps like
+        frame interpolation.
+        """
+        output = self.execute_model(request, self.od_config)
+        if self._worker_postprocess_func is not None:
+            from vllm_omni.diffusion.distributed.parallel_state import get_dit_group
+
+            output = self._worker_postprocess_func(
+                output,
+                sampling_params=request.sampling_params,
+                rank=self.rank,
+                group=get_dit_group(),
+            )
+        return output
 
     def profile(self, is_start: bool = True, profile_prefix: str | None = None) -> None:
         """Start or stop profiling for this GPU worker.

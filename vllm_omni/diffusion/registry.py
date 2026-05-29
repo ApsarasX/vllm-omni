@@ -601,3 +601,26 @@ def get_diffusion_pre_process_func(od_config: OmniDiffusionConfig):
         return None  # Return None if no pre-processing function is registered (for backward compatibility)
     func_name = _DIFFUSION_PRE_PROCESS_FUNCS[od_config.model_class_name]
     return _load_process_func(od_config, func_name)
+
+
+# Worker-side, NPU-resident post-processing. Called inside
+# ``DiffusionWorker.generate()`` right after ``execute_model`` returns and
+# before ``return_result`` triggers SHM pack, so the output tensor stays on
+# the accelerator (no d2h between the diffusion main loop and the steps
+# registered here). Pipelines that register a function here can compose
+# helpers from ``vllm_omni.diffusion.postprocess.worker_video_postprocess``.
+#
+# Signature of the registered factory: ``def get_xxx_worker_postprocess_func(od_config)``
+# Signature of the returned function:  ``def fn(output, *, sampling_params, rank, group)``
+_DIFFUSION_WORKER_POSTPROCESS_FUNCS: dict[str, str] = {}
+
+
+def get_diffusion_worker_postprocess_func(od_config: OmniDiffusionConfig):
+    """Return the pipeline's worker-side NPU post-processing function, or None.
+
+    See ``_DIFFUSION_WORKER_POSTPROCESS_FUNCS`` for the registration table.
+    """
+    if od_config.model_class_name not in _DIFFUSION_WORKER_POSTPROCESS_FUNCS:
+        return None
+    func_name = _DIFFUSION_WORKER_POSTPROCESS_FUNCS[od_config.model_class_name]
+    return _load_process_func(od_config, func_name)
