@@ -490,6 +490,10 @@ class OmniDiffusionConfig:
     vae_use_slicing: bool = False
     vae_use_tiling: bool = False
 
+    # Frame interpolation service configuration.
+    frame_interpolation_model_path: str | None = None
+    preload_frame_interpolation_model: bool = False
+
     # STA (Sliding Tile Attention) parameters
     mask_strategy_file_path: str | None = None
     # STA_mode: STA_Mode = STA_Mode.STA_INFERENCE

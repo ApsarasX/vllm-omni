@@ -151,6 +151,8 @@ class OmniEngineArgs(EngineArgs):
     force_cutlass_fp8: bool | None = None
     worker_type: str | None = None
     task_type: str | None = None
+    frame_interpolation_model_path: str | None = None
+    preload_frame_interpolation_model: bool = False
     worker_cls: str = None  # type: ignore[assignment]  # Upstream default is "auto"; omni resolves
     # in __post_init__ based on worker_type (ar/generation), so None is safe here.
     enable_sleep_mode: bool = False

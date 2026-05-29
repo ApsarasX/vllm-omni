@@ -541,6 +541,22 @@ class OmniServeCommand(CLISubcommand):
             help="Enable VAE tiling for memory optimization (useful for mitigating OOM issues).",
         )
 
+        # Frame interpolation service configuration.
+        omni_config_group.add_argument(
+            "--frame-interpolation-model-path",
+            type=str,
+            default=None,
+            help=(
+                "Local directory or Hugging Face repo ID containing RIFE flownet.pkl weights. "
+                "This is a service-level path and cannot be overridden by user requests."
+            ),
+        )
+        omni_config_group.add_argument(
+            "--preload-frame-interpolation-model",
+            action="store_true",
+            help="Preload the RIFE frame interpolation model during diffusion engine startup.",
+        )
+
         # Parallel weight loading (faster diffusion startup)
         omni_config_group.add_argument(
             "--disable-multithread-weight-load",

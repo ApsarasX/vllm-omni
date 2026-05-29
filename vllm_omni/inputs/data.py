@@ -231,7 +231,6 @@ class OmniDiffusionSamplingParams:
     enable_frame_interpolation: bool = False
     frame_interpolation_exp: int = 1
     frame_interpolation_scale: float = 1.0
-    frame_interpolation_model_path: str | None = None
 
     # Timesteps
     timesteps: torch.Tensor | None = None

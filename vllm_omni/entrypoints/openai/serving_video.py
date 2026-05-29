@@ -125,8 +125,6 @@ class OmniOpenAIServingVideo:
             gen_params.frame_interpolation_exp = request.frame_interpolation_exp
         if "frame_interpolation_scale" in provided_fields:
             gen_params.frame_interpolation_scale = request.frame_interpolation_scale
-        if "frame_interpolation_model_path" in provided_fields:
-            gen_params.frame_interpolation_model_path = request.frame_interpolation_model_path
 
         if "num_inference_steps" in provided_fields and request.num_inference_steps is not None:
             gen_params.num_inference_steps = request.num_inference_steps

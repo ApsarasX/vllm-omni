@@ -165,13 +165,6 @@ class VideoGenerationRequest(BaseModel):
         gt=0.0,
         description="RIFE inference scale. Use 0.5 for high-resolution inputs to save memory.",
     )
-    frame_interpolation_model_path: str | None = Field(
-        default=None,
-        description=(
-            "Local directory or Hugging Face repo ID containing RIFE flownet.pkl weights. "
-            "Defaults to elfgum/RIFE-4.22.lite."
-        ),
-    )
 
     # vllm-omni extension for per-request LoRA.
     lora: dict[str, Any] | None = Field(

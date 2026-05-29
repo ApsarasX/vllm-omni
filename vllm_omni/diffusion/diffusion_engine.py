@@ -10,6 +10,7 @@ import queue
 import threading
 import time
 from collections.abc import Iterable
+from copy import copy
 from dataclasses import dataclass, field
 from typing import Any
 
@@ -245,17 +246,51 @@ class DiffusionEngine:
             output_data = output_data.cpu()
 
         postprocess_start_time = time.perf_counter()
+        # Frame interpolation runs inline inside ``DiffusionWorker.generate()``
+        # via the pipeline-registered ``worker_postprocess_func`` and surfaces
+        # itself with ``custom_output["video_fps_multiplier"]``. The engine
+        # only reads that marker; the legacy in-postprocess code path is
+        # gone.
+        frame_interpolation_multiplier = None
+        postprocess_sampling_params = request.sampling_params
+        worker_did_inline_fi = (
+            isinstance(output.custom_output, dict)
+            and "video_fps_multiplier" in output.custom_output
+        )
+        if worker_did_inline_fi:
+            frame_interpolation_multiplier = int(output.custom_output["video_fps_multiplier"])
+            # Shallow copy is intentional and sufficient: we only flip a bool
+            # field (``enable_frame_interpolation``) so no nested mutation
+            # leaks back into the request's sampling_params. Future edits
+            # that touch dict / tensor fields here must reassess (use
+            # ``copy.deepcopy`` or construct a new SamplingParams instead).
+            postprocess_sampling_params = copy(request.sampling_params)
+            postprocess_sampling_params.enable_frame_interpolation = False
+        elif getattr(request.sampling_params, "enable_frame_interpolation", False):
+            # Fail loud: user asked for FI but the worker hook didn't run
+            # (no registered worker_postprocess_func, hook short-circuited,
+            # or a code bug). Returning the un-interpolated video silently
+            # would be hard to diagnose at the API layer.
+            logger.warning(
+                "enable_frame_interpolation=True but worker did not produce "
+                "video_fps_multiplier; pipeline %r may be missing a "
+                "worker_postprocess_func registration. Returning the original "
+                "video without interpolation.",
+                self.od_config.model_class_name,
+            )
         if self.post_process_func is not None:
             # Some video pipelines need request-level controls during
             # postprocess (for example worker-side frame interpolation).
             if self._post_process_accepts_sampling_params:
-                outputs = self.post_process_func(output_data, sampling_params=request.sampling_params)
+                outputs = self.post_process_func(output_data, sampling_params=postprocess_sampling_params)
             else:
                 outputs = self.post_process_func(output_data)
         else:
             outputs = output_data
         audio_payload = None
         custom_output = output.custom_output or {}
+        if frame_interpolation_multiplier is not None:
+            custom_output["video_fps_multiplier"] = frame_interpolation_multiplier
         model_audio_sample_rate = None
         model_fps = None
         if isinstance(outputs, dict):
@@ -697,30 +732,75 @@ class DiffusionEngine:
             dummy_audio = np.random.randn(audio_sr * 2).astype(np.float32)
             prompt.setdefault("multi_modal_data", {})["audio"] = dummy_audio
 
+        # Preloading RIFE only has an effect when the pipeline registers a
+        # worker_postprocess_func — that's the only path that runs frame
+        # interpolation now. For pipelines without a hook we skip the dummy
+        # FI request entirely and warn the operator instead of silently
+        # taking the cost on the first real request.
+        from vllm_omni.diffusion.registry import _DIFFUSION_WORKER_POSTPROCESS_FUNCS
+
+        worker_supports_fi = self.od_config.model_class_name in _DIFFUSION_WORKER_POSTPROCESS_FUNCS
+        preload_fi = (
+            getattr(self.od_config, "preload_frame_interpolation_model", False) and worker_supports_fi
+        )
+        if getattr(self.od_config, "preload_frame_interpolation_model", False) and not worker_supports_fi:
+            logger.warning(
+                "preload_frame_interpolation_model=True but pipeline %r has no "
+                "registered worker_postprocess_func; skipping RIFE warmup. The "
+                "first interpolated request will not benefit from preload.",
+                self.od_config.model_class_name,
+            )
+
+        # Wan video pipelines align frame counts to 4k+1; 5 is the smallest
+        # frame count that survives alignment and has at least one adjacent
+        # frame pair to interpolate, so it loads RIFE without an
+        # unnecessarily long run.
+        _FI_WARMUP_FRAMES = 5
         num_frames = get_dummy_run_num_frames(self.od_config.model_class_name, supports_audio_input)
+        if preload_fi:
+            num_frames = max(num_frames, _FI_WARMUP_FRAMES)
+        sampling_params = OmniDiffusionSamplingParams(
+            height=height,
+            width=width,
+            num_inference_steps=num_inference_steps,
+            num_frames=num_frames,
+            fps=16 if preload_fi else None,
+            enable_frame_interpolation=preload_fi,
+            frame_interpolation_exp=1,
+            frame_interpolation_scale=1.0,
+            # Keep warmup path minimal and robust across text encoders.
+            # Some models may fail when warmup implicitly triggers
+            # classifier-free guidance with an empty negative prompt.
+            guidance_scale=0.0,
+            num_outputs_per_prompt=1,
+            # Disable CFG for warmup to avoid triggering CFG parallel
+            # validation when cfg_parallel_size > 1.
+            extra_args={"cfg_text_scale": 1.0, "cfg_img_scale": 1.0},
+        )
         req = OmniDiffusionRequest(
             prompts=[prompt],
             request_id=DUMMY_DIFFUSION_REQUEST_ID,
-            sampling_params=OmniDiffusionSamplingParams(
-                height=height,
-                width=width,
-                num_inference_steps=num_inference_steps,
-                num_frames=num_frames,
-                # Keep warmup path minimal and robust across text encoders.
-                # Some models may fail when warmup implicitly triggers
-                # classifier-free guidance with an empty negative prompt.
-                guidance_scale=0.0,
-                num_outputs_per_prompt=1,
-                # Disable CFG for warmup to avoid triggering CFG parallel
-                # validation when cfg_parallel_size > 1.
-                extra_args={"cfg_text_scale": 1.0, "cfg_img_scale": 1.0},
-            ),
+            sampling_params=sampling_params,
         )
         logger.info("dummy run to warm up the model")
         request = self.pre_process_func(req) if self.pre_process_func is not None else req
         output = self.add_req_and_wait_for_response(request)
         if output.error:
             raise RuntimeError(f"Dummy run failed: {output.error}")
+        # With the inline architecture the worker runs RIFE inside
+        # ``generate()`` itself. Issuing the dummy request with
+        # ``enable_frame_interpolation=True`` should have loaded the RIFE
+        # model on each worker's NPU. Verify by checking the marker so we
+        # raise at startup if the hook silently dropped FI (e.g. due to a
+        # registration bug).
+        if preload_fi and not (
+            isinstance(output.custom_output, dict) and "video_fps_multiplier" in output.custom_output
+        ):
+            raise RuntimeError(
+                "RIFE warmup failed: worker_postprocess_func did not emit "
+                f"video_fps_multiplier for pipeline {self.od_config.model_class_name!r} "
+                f"(frame_interpolation_model_path={self.od_config.frame_interpolation_model_path!r})."
+            )
 
     def _submit_rpc(
         self,

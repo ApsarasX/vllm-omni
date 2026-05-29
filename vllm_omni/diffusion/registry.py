@@ -612,7 +612,10 @@ def get_diffusion_pre_process_func(od_config: OmniDiffusionConfig):
 #
 # Signature of the registered factory: ``def get_xxx_worker_postprocess_func(od_config)``
 # Signature of the returned function:  ``def fn(output, *, sampling_params, rank, group)``
-_DIFFUSION_WORKER_POSTPROCESS_FUNCS: dict[str, str] = {}
+_DIFFUSION_WORKER_POSTPROCESS_FUNCS: dict[str, str] = {
+    "WanPipeline": "get_wan22_worker_postprocess_func",
+    "WanImageToVideoPipeline": "get_wan22_i2v_worker_postprocess_func",
+}
 
 
 def get_diffusion_worker_postprocess_func(od_config: OmniDiffusionConfig):

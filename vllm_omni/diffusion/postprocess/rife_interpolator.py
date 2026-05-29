@@ -18,6 +18,7 @@ import threading
 from typing import Any
 
 import torch
+import torch.distributed as dist
 import torch.nn as nn
 import torch.nn.functional as F
 from vllm.logger import init_logger
@@ -343,6 +344,34 @@ def _normalize_video_tensor_layout(video: torch.Tensor) -> tuple[torch.Tensor, A
     raise ValueError(f"Unsupported video tensor shape for interpolation: {tuple(video.shape)}")
 
 
+def get_video_frame_count(video: torch.Tensor) -> int:
+    """Return the number of frames using RIFE's supported tensor layouts."""
+    normalized_video, _ = _normalize_video_tensor_layout(video)
+    return int(normalized_video.shape[2])
+
+
+def get_frame_interpolation_pair_range(num_pairs: int, world_size: int, rank: int) -> tuple[int, int]:
+    """Return the contiguous adjacent-frame pair range assigned to a rank.
+
+    All ranks together cover ``[0, num_pairs)``; the remainder (when
+    ``num_pairs`` is not divisible by ``world_size``) is distributed to the
+    low-rank ranks, so neighbouring shards still join cleanly without
+    overlap.
+    """
+    if num_pairs < 0:
+        raise ValueError(f"num_pairs must be >= 0, got {num_pairs}")
+    if world_size < 1:
+        raise ValueError(f"world_size must be >= 1, got {world_size}")
+    if rank < 0 or rank >= world_size:
+        raise ValueError(f"rank must be in [0, {world_size}), got {rank}")
+
+    base = num_pairs // world_size
+    remainder = num_pairs % world_size
+    start = rank * base + min(rank, remainder)
+    end = start + base + (1 if rank < remainder else 0)
+    return start, end
+
+
 def _normalize_video_tensor_range(video: torch.Tensor) -> tuple[torch.Tensor, Any]:
     original_dtype = video.dtype
     video = video.detach()
@@ -431,6 +460,57 @@ class FrameInterpolator:
         result = torch.stack(result_frames, dim=2)
         return restore_layout(restore_range(result)), 2**exp
 
+    def interpolate_tensor_pair_range(
+        self,
+        video: torch.Tensor,
+        start_pair: int,
+        end_pair: int,
+        exp: int = 1,
+        scale: float = 1.0,
+    ) -> tuple[torch.Tensor, int]:
+        """Run RIFE on a contiguous adjacent-frame pair range [start_pair, end_pair).
+
+        Used by the distributed entry point to split work across ranks. The
+        input must already be in (B, C, T, H, W) layout and value range
+        [0, 1] (i.e. the caller has run ``_normalize_video_tensor_layout``
+        and ``_normalize_video_tensor_range``).
+        """
+        if exp < 1:
+            raise ValueError(f"frame interpolation exp must be >= 1, got {exp}")
+        if scale <= 0:
+            raise ValueError(f"frame interpolation scale must be > 0, got {scale}")
+
+        num_pairs = video.shape[2] - 1
+        if start_pair < 0 or end_pair < start_pair or end_pair > num_pairs:
+            raise ValueError(
+                f"Invalid pair range [{start_pair}, {end_pair}) for {num_pairs} adjacent frame pairs"
+            )
+
+        preferred_device = video.device
+        if preferred_device.type == "cpu":
+            preferred_device = _select_torch_device()
+        model = self._ensure_model_loaded(preferred_device=preferred_device)
+        video = video.to(model.device())
+        if start_pair == end_pair:
+            # Empty shard still reports the canonical FPS multiplier (2**exp)
+            # so callers don't need to special-case it during gather: the
+            # multiplier is a property of the requested interpolation, not of
+            # how many pairs this rank happened to be assigned.
+            return video[:, :, :0, :, :], 2**exp
+        intermediates_per_pair = 2**exp // 2
+
+        result_frames: list[torch.Tensor] = []
+        for idx in range(start_pair, end_pair):
+            img0 = video[:, :, idx, :, :]
+            img1 = video[:, :, idx + 1, :, :]
+            result_frames.append(img0)
+            result_frames.extend(self._make_inference(model, img0, img1, intermediates_per_pair, scale))
+        # Only the last rank in the partition appends the final frame, so
+        # concatenated shards reproduce the full interpolated sequence exactly.
+        if end_pair == num_pairs:
+            result_frames.append(video[:, :, -1, :, :])
+        return torch.stack(result_frames, dim=2), 2**exp
+
 
 def interpolate_video_tensor(
     video: torch.Tensor,
@@ -441,3 +521,113 @@ def interpolate_video_tensor(
     """Interpolate a video tensor and return the FPS multiplier."""
     interpolator = FrameInterpolator(model_path=model_path)
     return interpolator.interpolate_tensor(video, exp=exp, scale=scale)
+
+
+def _gather_interpolated_shards_to_rank0(
+    local_video: torch.Tensor, group: dist.ProcessGroup | None
+) -> torch.Tensor:
+    """Gather per-rank interpolated shards back to rank 0 on the accelerator.
+
+    Shapes can differ across ranks (the last rank carries one extra frame),
+    so each rank first all_gathers its shape, pads to ``max_shape``, then
+    all_gathers the padded data. HCCL's ``gather`` path is slow on NPU, so
+    we use ``all_gather`` and discard the broadcast on non-zero ranks.
+    """
+    device = local_video.device
+    rank = dist.get_rank(group=group)
+    world_size = dist.get_world_size(group=group)
+    shape_tensor = torch.tensor(tuple(local_video.shape), device=device, dtype=torch.int64)
+    shape_tensors = [torch.empty_like(shape_tensor) for _ in range(world_size)]
+    dist.all_gather(shape_tensors, shape_tensor, group=group)
+
+    shapes = [tuple(int(v) for v in shape.cpu().tolist()) for shape in shape_tensors]
+    max_shape = tuple(max(shape[dim] for shape in shapes) for dim in range(local_video.ndim))
+    padded = torch.zeros(max_shape, device=device, dtype=local_video.dtype)
+    if local_video.numel() > 0:
+        slices = tuple(slice(0, size) for size in local_video.shape)
+        padded[slices] = local_video
+
+    gathered = [torch.empty_like(padded) for _ in range(world_size)]
+    dist.all_gather(gathered, padded, group=group)
+
+    if rank != 0:
+        return local_video[:, :, :0, :, :]
+
+    # Keep shards on accelerator: slice = NPU view (zero-copy), cat = single
+    # NPU kernel. Avoid per-shard .cpu() which serialises N PCIe transfers.
+    # Caller runs restore_range / restore_layout on NPU; only the SHM pack
+    # at the end of the worker pipeline triggers a single d2h.
+    shards = []
+    for shard, shape in zip(gathered, shapes):
+        if shape[2] == 0:
+            continue
+        slices = tuple(slice(0, size) for size in shape)
+        shards.append(shard[slices])
+    if not shards:
+        return local_video[:, :, :0, :, :]
+    return torch.cat(shards, dim=2)
+
+
+def interpolate_video_tensor_distributed(
+    video: torch.Tensor,
+    exp: int = 1,
+    scale: float = 1.0,
+    model_path: str | None = None,
+    group: dist.ProcessGroup | None = None,
+) -> tuple[torch.Tensor, int]:
+    """Interpolate a video tensor by assigning contiguous time ranges to ranks.
+
+    All ranks must call this function with the same input. Rank 0 returns
+    the assembled video. Non-zero ranks return an empty sentinel shard used
+    only to complete collective execution; callers must not consume
+    non-rank-0 results.
+
+    The result is kept on accelerator (no .cpu() here); the caller decides
+    when to incur the single d2h required for downstream IPC / serialization.
+    """
+    if not dist.is_available() or not dist.is_initialized():
+        return interpolate_video_tensor(video, exp=exp, scale=scale, model_path=model_path)
+
+    rank = dist.get_rank(group=group)
+    world_size = dist.get_world_size(group=group)
+    video, restore_layout = _normalize_video_tensor_layout(video)
+    if video.shape[2] < 2:
+        return restore_layout(video), 1
+
+    # Upload to accelerator BEFORE the dtype conversion so the fp32 promotion
+    # in _normalize_video_tensor_range runs on NPU (~10x faster than CPU on
+    # large tensors), and we ship the smaller bf16 input over PCIe instead of
+    # the fp32 promoted tensor.
+    target_device = _select_torch_device() if video.device.type == "cpu" else video.device
+    video = video.to(target_device, non_blocking=True)
+
+    video, restore_range = _normalize_video_tensor_range(video)
+
+    num_pairs = video.shape[2] - 1
+    start_pair, end_pair = get_frame_interpolation_pair_range(num_pairs, world_size, rank)
+    if rank == 0:
+        rank_ranges = [
+            get_frame_interpolation_pair_range(num_pairs, world_size, rank_id) for rank_id in range(world_size)
+        ]
+        logger.info(
+            "RIFE distributed interpolation across %d ranks: "
+            "num_frames=%d num_adjacent_pairs=%d rank_pair_ranges=%s",
+            world_size,
+            int(video.shape[2]),
+            num_pairs,
+            rank_ranges,
+        )
+
+    interpolator = FrameInterpolator(model_path=model_path)
+    local_video, multiplier = interpolator.interpolate_tensor_pair_range(
+        video,
+        start_pair=start_pair,
+        end_pair=end_pair,
+        exp=exp,
+        scale=scale,
+    )
+    merged_video = _gather_interpolated_shards_to_rank0(local_video, group)
+
+    if rank == 0:
+        merged_video = restore_layout(restore_range(merged_video))
+    return merged_video, multiplier
