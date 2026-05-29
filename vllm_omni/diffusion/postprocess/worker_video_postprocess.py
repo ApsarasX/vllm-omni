@@ -45,6 +45,17 @@ _DTYPE_TO_CODE: dict[torch.dtype, int] = {
 _CODE_TO_DTYPE: dict[int, torch.dtype] = {v: k for k, v in _DTYPE_TO_CODE.items()}
 
 
+# --- Worker → engine post-process bypass markers ---------------------------
+# Worker stuffs ``custom_output[VIDEO_FORMAT_KEY] = VIDEO_FORMAT_UINT8_BTHWC``
+# to tell the engine it has already done bf16→uint8 + permute on NPU. The
+# engine reads these in ``DiffusionEngine.step`` and short-circuits
+# ``post_process_func`` accordingly. Importing the constants on both sides
+# prevents the kind of silent-failure typo bug that bare string literals
+# invite.
+VIDEO_FORMAT_KEY = "video_format"
+VIDEO_FORMAT_UINT8_BTHWC = "uint8_bthwc"
+
+
 def maybe_interpolate_video_inline(
     output: DiffusionOutput,
     sampling_params: Any,
@@ -165,11 +176,55 @@ def maybe_interpolate_video_inline(
     return output
 
 
+def maybe_convert_video_to_uint8_on_npu(
+    output: DiffusionOutput,
+    rank: int,
+) -> DiffusionOutput:
+    """Mirror diffusers' VideoProcessor.postprocess_video on NPU.
+
+    Input:  bf16/fp32 NPU tensor in (B, C, T, H, W), value range [-1, 1]
+            (standard VAE decode output).
+    Output: uint8 NPU tensor in (B, T, H, W, C), value range [0, 255].
+
+    Engine detects ``custom_output["video_format"] == "uint8_bthwc"`` and
+    skips its post_process_func, treating the tensor as already-formatted
+    frames. Halves the SHM transfer size and eliminates the ~600 ms CPU
+    dtype-conversion the engine would otherwise do.
+    """
+    if rank != 0:
+        return output
+    if not isinstance(output.output, torch.Tensor):
+        return output
+    tensor = output.output
+    if tensor.device.type == "cpu" or not tensor.is_floating_point():
+        return output
+    # Recognise (B, C, T, H, W) with C in (3, 4); the canonical layout video
+    # pipelines produce after restore_layout. Other shapes fall through to
+    # the engine post_process_func.
+    if tensor.dim() != 5 or tensor.shape[1] not in (3, 4):
+        return output
+
+    # Equivalent to diffusers' VaeImageProcessor.postprocess for "np":
+    #   ((x / 2) + 0.5).clamp(0, 1) -> permute to HWC -> *255 round uint8
+    out = tensor.to(torch.float32)
+    out = (out / 2.0 + 0.5).clamp_(0.0, 1.0)
+    out = out.permute(0, 2, 3, 4, 1).contiguous()  # (B,C,T,H,W) -> (B,T,H,W,C)
+    out = (out * 255.0).round_().clamp_(0, 255).to(torch.uint8)
+
+    output.output = out
+    if not isinstance(output.custom_output, dict):
+        output.custom_output = {}
+    output.custom_output[VIDEO_FORMAT_KEY] = VIDEO_FORMAT_UINT8_BTHWC
+    return output
+
+
 def make_video_worker_postprocess_func(od_config: OmniDiffusionConfig):
     """Default video pipeline worker_postprocess_func factory.
 
-    Returned function runs distributed RIFE inline on NPU. Pipelines whose
-    output matches the standard ``(B, C, T, H, W)`` layout can simply
+    Returned function runs distributed RIFE inline on NPU, then converts
+    bf16/fp32 (B, C, T, H, W) output to uint8 (B, T, H, W, C) on NPU so
+    the engine's post_process_func can be bypassed entirely. Pipelines
+    whose output matches this standard layout can simply
     ``return make_video_worker_postprocess_func(od_config)`` from their
     ``get_xxx_worker_postprocess_func`` factory. Pipelines that need
     different NPU-side steps can compose the individual helpers in this
@@ -177,6 +232,8 @@ def make_video_worker_postprocess_func(od_config: OmniDiffusionConfig):
     """
 
     def worker_postprocess_func(output, *, sampling_params, rank, group):
-        return maybe_interpolate_video_inline(output, sampling_params, od_config, rank, group)
+        output = maybe_interpolate_video_inline(output, sampling_params, od_config, rank, group)
+        output = maybe_convert_video_to_uint8_on_npu(output, rank)
+        return output
 
     return worker_postprocess_func

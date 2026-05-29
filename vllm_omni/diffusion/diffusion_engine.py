@@ -278,7 +278,21 @@ class DiffusionEngine:
                 "video without interpolation.",
                 self.od_config.model_class_name,
             )
-        if self.post_process_func is not None:
+        # Worker may have pre-converted the video to uint8 (B,T,H,W,C) on
+        # NPU before SHM pack to skip the engine-side numpy conversion that
+        # otherwise dominates postprocess time (~600 ms on 367 MB bf16).
+        from vllm_omni.diffusion.postprocess.worker_video_postprocess import (
+            VIDEO_FORMAT_KEY,
+            VIDEO_FORMAT_UINT8_BTHWC,
+        )
+
+        worker_did_uint8 = (
+            isinstance(output.custom_output, dict)
+            and output.custom_output.get(VIDEO_FORMAT_KEY) == VIDEO_FORMAT_UINT8_BTHWC
+        )
+        if worker_did_uint8 and isinstance(output_data, torch.Tensor):
+            outputs = {"video": output_data.numpy(), "custom_output": {}}
+        elif self.post_process_func is not None:
             # Some video pipelines need request-level controls during
             # postprocess (for example worker-side frame interpolation).
             if self._post_process_accepts_sampling_params:
