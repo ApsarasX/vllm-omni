@@ -1962,6 +1962,8 @@ class AsyncOmniEngine:
             "step_execution": kwargs.get("step_execution", False),
             "vae_use_slicing": kwargs.get("vae_use_slicing", False),
             "vae_use_tiling": kwargs.get("vae_use_tiling", False),
+            "frame_interpolation_model_path": kwargs.get("frame_interpolation_model_path", None),
+            "preload_frame_interpolation_model": kwargs.get("preload_frame_interpolation_model", False),
             "cache_backend": cache_backend,
             "cache_config": cache_config,
             "enable_cache_dit_summary": kwargs.get("enable_cache_dit_summary", False),
@@ -2192,6 +2194,23 @@ class AsyncOmniEngine:
                         cfg.engine_args.diffusion_kv_cache_skip_layers = diffusion_kv_cache_skip_layers
             except Exception as e:
                 logger.warning("Failed to inject LoRA config for stage: %s", e)
+
+            try:
+                frame_interpolation_model_path = kwargs.get("frame_interpolation_model_path")
+                if frame_interpolation_model_path is not None:
+                    if (
+                        not hasattr(cfg.engine_args, "frame_interpolation_model_path")
+                        or cfg.engine_args.frame_interpolation_model_path is None
+                    ):
+                        cfg.engine_args.frame_interpolation_model_path = frame_interpolation_model_path
+                if bool(kwargs.get("preload_frame_interpolation_model")):
+                    if (
+                        not hasattr(cfg.engine_args, "preload_frame_interpolation_model")
+                        or cfg.engine_args.preload_frame_interpolation_model is None
+                    ):
+                        cfg.engine_args.preload_frame_interpolation_model = True
+            except Exception as e:
+                logger.warning("Failed to inject frame interpolation config for stage: %s", e)
 
         return config_path, stage_configs
 

@@ -428,7 +428,6 @@ def test_frame_interpolation_params_pass_to_diffusion_sampling_params(test_clien
             "enable_frame_interpolation": "true",
             "frame_interpolation_exp": "2",
             "frame_interpolation_scale": "0.5",
-            "frame_interpolation_model_path": "local-rife",
         },
     )
 
@@ -441,7 +440,6 @@ def test_frame_interpolation_params_pass_to_diffusion_sampling_params(test_clien
     assert captured.enable_frame_interpolation is True
     assert captured.frame_interpolation_exp == 2
     assert captured.frame_interpolation_scale == 0.5
-    assert captured.frame_interpolation_model_path == "local-rife"
 
 
 def test_default_sampling_params_apply_to_video_requests(test_client, mocker: MockerFixture):
@@ -458,7 +456,6 @@ def test_default_sampling_params_apply_to_video_requests(test_client, mocker: Mo
             enable_frame_interpolation=True,
             frame_interpolation_exp=2,
             frame_interpolation_scale=0.5,
-            frame_interpolation_model_path="default-rife",
         )
     ]
 
@@ -480,7 +477,6 @@ def test_default_sampling_params_apply_to_video_requests(test_client, mocker: Mo
     assert captured.enable_frame_interpolation is True
     assert captured.frame_interpolation_exp == 2
     assert captured.frame_interpolation_scale == 0.5
-    assert captured.frame_interpolation_model_path == "default-rife"
 
 
 def test_request_params_override_default_video_sampling_params(test_client, mocker: MockerFixture):
@@ -496,7 +492,6 @@ def test_request_params_override_default_video_sampling_params(test_client, mock
             enable_frame_interpolation=True,
             frame_interpolation_exp=2,
             frame_interpolation_scale=0.5,
-            frame_interpolation_model_path="default-rife",
         )
     ]
 
@@ -508,7 +503,6 @@ def test_request_params_override_default_video_sampling_params(test_client, mock
             "enable_frame_interpolation": "false",
             "frame_interpolation_exp": "1",
             "frame_interpolation_scale": "1.0",
-            "frame_interpolation_model_path": "custom-rife",
         },
     )
 
@@ -522,7 +516,6 @@ def test_request_params_override_default_video_sampling_params(test_client, mock
     assert captured.enable_frame_interpolation is False
     assert captured.frame_interpolation_exp == 1
     assert captured.frame_interpolation_scale == 1.0
-    assert captured.frame_interpolation_model_path == "custom-rife"
 
 
 def test_worker_fps_multiplier_is_applied_to_async_encoding(test_client, mocker: MockerFixture):
@@ -1217,7 +1210,6 @@ def test_sync_frame_interpolation_params_pass_to_sampling_params(test_client, mo
             "enable_frame_interpolation": "true",
             "frame_interpolation_exp": "2",
             "frame_interpolation_scale": "0.5",
-            "frame_interpolation_model_path": "local-rife",
         },
     )
 
@@ -1227,7 +1219,6 @@ def test_sync_frame_interpolation_params_pass_to_sampling_params(test_client, mo
     assert captured.enable_frame_interpolation is True
     assert captured.frame_interpolation_exp == 2
     assert captured.frame_interpolation_scale == 0.5
-    assert captured.frame_interpolation_model_path == "local-rife"
     _, kwargs = encode_mock.call_args
     assert kwargs["fps"] == 8
 
@@ -1242,7 +1233,6 @@ def test_sync_default_sampling_params_apply_to_video_requests(test_client, mocke
             enable_frame_interpolation=True,
             frame_interpolation_exp=2,
             frame_interpolation_scale=0.5,
-            frame_interpolation_model_path="default-rife",
         )
     ]
 
@@ -1262,7 +1252,6 @@ def test_sync_default_sampling_params_apply_to_video_requests(test_client, mocke
     assert captured.enable_frame_interpolation is True
     assert captured.frame_interpolation_exp == 2
     assert captured.frame_interpolation_scale == 0.5
-    assert captured.frame_interpolation_model_path == "default-rife"
 
 
 def test_worker_fps_multiplier_is_applied_to_sync_encoding(test_client, mocker: MockerFixture):

@@ -4,6 +4,7 @@
 from types import SimpleNamespace
 
 import pytest
+from omegaconf import OmegaConf
 from vllm.utils.argparse_utils import FlexibleArgumentParser
 
 from vllm_omni.config.stage_config import deploy_override_field_names
@@ -342,3 +343,76 @@ def test_resolve_stage_configs_injects_additional_config_into_diffusion_stage(mo
 
     assert not hasattr(stage_configs[0].engine_args, "additional_config")
     assert stage_configs[1].engine_args.additional_config == {"torchair_graph_config": {"enabled": True}}
+
+
+def test_default_stage_config_includes_frame_interpolation_service_config():
+    """Ensure frame interpolation service knobs survive default stage creation."""
+    stage_cfg = AsyncOmniEngine._create_default_diffusion_stage_cfg(
+        {
+            "frame_interpolation_model_path": "/models/rife",
+            "preload_frame_interpolation_model": True,
+        }
+    )[0]
+
+    engine_args = stage_cfg["engine_args"]
+    assert engine_args["frame_interpolation_model_path"] == "/models/rife"
+    assert engine_args["preload_frame_interpolation_model"] is True
+
+
+def test_stage_config_frame_interpolation_service_config_wins_over_cli(monkeypatch):
+    stage_cfg = OmegaConf.create(
+        {
+            "stage_type": "diffusion",
+            "engine_args": {
+                "frame_interpolation_model_path": "/stage/rife",
+                "preload_frame_interpolation_model": False,
+            },
+        }
+    )
+
+    def _fake_load_and_resolve_stage_configs(*args, **kwargs):
+        del args, kwargs
+        return "stage.yaml", [stage_cfg]
+
+    monkeypatch.setattr(
+        "vllm_omni.engine.async_omni_engine.load_and_resolve_stage_configs",
+        _fake_load_and_resolve_stage_configs,
+    )
+    engine = AsyncOmniEngine.__new__(AsyncOmniEngine)
+    engine._strip_single_engine_args = lambda kwargs: kwargs
+
+    _config_path, resolved_stage_configs = engine._resolve_stage_configs(
+        "Wan-AI/Wan2.2-T2V-A14B-Diffusers",
+        {
+            "frame_interpolation_model_path": "/cli/rife",
+            "preload_frame_interpolation_model": True,
+        },
+    )
+
+    engine_args = resolved_stage_configs[0].engine_args
+    assert engine_args.frame_interpolation_model_path == "/stage/rife"
+    assert engine_args.preload_frame_interpolation_model is False
+
+
+def test_serve_cli_accepts_frame_interpolation_service_config():
+    """Ensure frame interpolation service args wire into diffusion engine args."""
+    parser = FlexibleArgumentParser()
+    subparsers = parser.add_subparsers(dest="command")
+    OmniServeCommand().subparser_init(subparsers)
+
+    args = parser.parse_args(
+        [
+            "serve",
+            "Wan-AI/Wan2.2-T2V-A14B-Diffusers",
+            "--omni",
+            "--frame-interpolation-model-path",
+            "/models/rife",
+            "--preload-frame-interpolation-model",
+        ]
+    )
+
+    stage_cfg = _create_default_diffusion_stage_cfg(args)[0]
+    engine_args = stage_cfg["engine_args"]
+
+    assert engine_args["frame_interpolation_model_path"] == "/models/rife"
+    assert engine_args["preload_frame_interpolation_model"] is True

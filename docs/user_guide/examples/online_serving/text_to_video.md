@@ -193,7 +193,6 @@ curl -X POST http://localhost:8091/v1/videos \
 | `enable_frame_interpolation` | bool | false | Enable RIFE frame interpolation before MP4 encoding |
 | `frame_interpolation_exp` | int | 1 | Interpolation exponent; 1=2x temporal resolution, 2=4x |
 | `frame_interpolation_scale` | float | 1.0 | RIFE inference scale; use 0.5 for high-resolution inputs |
-| `frame_interpolation_model_path` | str | None | Local directory or Hugging Face repo ID with `flownet.pkl`; defaults to `elfgum/RIFE-4.22.lite` |
 
 ## Frame Interpolation
 
@@ -203,9 +202,15 @@ without rerunning the diffusion model. If the generated video has `N` frames,
 the interpolated output frame count is `(N - 1) * 2**exp + 1`. The encoder FPS
 is multiplied by `2**exp` so the output duration remains close to the original.
 
-Frame interpolation runs in the diffusion worker post-processing path instead of
-the API server encoding path, so it can reuse the worker's current accelerator
-device without blocking the FastAPI event loop.
+Frame interpolation is coordinated by the diffusion engine and runs on
+diffusion workers instead of the API server encoding path, so it does not block
+the FastAPI event loop and can split adjacent-frame pairs across ranks.
+Configure RIFE weights with `--frame-interpolation-model-path`; add
+`--preload-frame-interpolation-model` to load them during service startup. If
+no model path is provided, vLLM-Omni resolves the default
+`elfgum/RIFE-4.22.lite` repo when RIFE is loaded. Preloading increases startup
+time and device memory allocation at startup, but avoids the one-time RIFE load
+cost on the first interpolated request.
 
 Example: generate 5 frames and interpolate to 9 frames:
 

@@ -625,6 +625,71 @@ class TestWorker:
         assert "req-1" not in worker._step_lora_state
         assert worker._step_lora_state == {"req-2": (lora_request, 1.0)}
 
+    def test_generate_invokes_worker_postprocess_func_with_context(
+        self, monkeypatch: pytest.MonkeyPatch, mocker: MockerFixture
+    ):
+        """``DiffusionWorker.generate()`` must run the pipeline-registered
+        ``_worker_postprocess_func`` after ``execute_model`` returns, and
+        must pass ``sampling_params`` / ``rank`` / ``group`` via keyword so
+        the hook contract holds. This pins down the inline-RIFE entry
+        point — without this test, a missing hook call would silently drop
+        frame interpolation entirely.
+        """
+        worker = object.__new__(DiffusionWorker)
+        worker.rank = 0
+        worker.od_config = mocker.Mock()
+
+        raw_output = DiffusionOutput(output=torch.zeros(1, 3, 2, 4, 4))
+        processed_output = DiffusionOutput(
+            output=torch.ones(1, 3, 3, 4, 4), custom_output={"video_fps_multiplier": 2}
+        )
+
+        request = mocker.Mock(sampling_params=mocker.Mock(enable_frame_interpolation=True))
+
+        execute_calls = []
+
+        def _fake_execute_model(req, od_config):
+            execute_calls.append((req, od_config))
+            return raw_output
+
+        worker.execute_model = _fake_execute_model
+
+        hook_calls = []
+
+        def _fake_hook(output, *, sampling_params, rank, group):
+            hook_calls.append((output, sampling_params, rank, group))
+            return processed_output
+
+        worker._worker_postprocess_func = _fake_hook
+
+        group_sentinel = object()
+        monkeypatch.setattr(
+            "vllm_omni.diffusion.distributed.parallel_state.get_dit_group",
+            lambda: group_sentinel,
+        )
+
+        result = DiffusionWorker.generate(worker, request)
+
+        assert result is processed_output
+        assert execute_calls == [(request, worker.od_config)]
+        assert len(hook_calls) == 1
+        assert hook_calls[0] == (raw_output, request.sampling_params, 0, group_sentinel)
+
+    def test_generate_passes_through_when_no_worker_postprocess_func(self, mocker: MockerFixture):
+        """Pipelines that don't register a worker hook get the plain
+        ``execute_model`` output. This is the safety property: opting in
+        is additive, never required."""
+        worker = object.__new__(DiffusionWorker)
+        worker.rank = 0
+        worker.od_config = mocker.Mock()
+        worker._worker_postprocess_func = None
+
+        raw_output = DiffusionOutput(output=torch.zeros(1, 3, 2, 4, 4))
+        worker.execute_model = lambda req, od_config: raw_output
+
+        result = DiffusionWorker.generate(worker, mocker.Mock())
+        assert result is raw_output
+
 
 @pytest.mark.cpu
 class TestExecutor:
@@ -786,6 +851,60 @@ class TestIPC:
         unpacked = unpack_diffusion_output_shm(packed)
         assert isinstance(unpacked.result.output, torch.Tensor)
         torch.testing.assert_close(unpacked.result.output, tensor)
+
+    def test_collective_rpc_unpacks_shm_packed_response(self):
+        """Worker→engine protocol: ``collective_rpc`` must unpack SHM-packed
+        ``DiffusionOutput`` replies before returning them. The inline-RIFE
+        and NPU-uint8 fast paths emit SHM-packed payloads on every call;
+        swallowing the unpack here would leave callers with
+        ``output.output == {"__tensor_shm__": ...}`` (a dict, not a Tensor)
+        and the SHM segment leaked. Pin the contract so any future ``try /
+        except + warning`` regression is caught.
+        """
+        tensor = torch.zeros(300_000, dtype=torch.float32)
+        packed = pack_diffusion_output_shm(DiffusionOutput(output=tensor))
+        # Sanity: packed actually replaces the tensor with a SHM handle dict.
+        assert isinstance(packed.output, dict)
+        assert packed.output.get("__tensor_shm__") is True
+
+        class _BroadcastQueue:
+            def __init__(self):
+                self.requests = []
+
+            def enqueue(self, request):
+                self.requests.append(request)
+
+        executor = object.__new__(MultiprocDiffusionExecutor)
+        executor._closed = False
+        executor._broadcast_mq = _BroadcastQueue()
+        # Provide the dequeue helper used inside collective_rpc.
+        executor._dequeue_one_with_failure_polling = lambda deadline, method: packed
+        # _ensure_open is the gate at the top of collective_rpc; bypass it.
+        executor._ensure_open = lambda: None
+
+        responses = MultiprocDiffusionExecutor.collective_rpc(
+            executor,
+            method="some_worker_method",
+            args=("video",),
+            kwargs={"exp": 1},
+        )
+
+        # Request was broadcast unchanged.
+        assert executor._broadcast_mq.requests == [
+            {
+                "type": "rpc",
+                "method": "some_worker_method",
+                "args": ("video",),
+                "kwargs": {"exp": 1},
+                "output_rank": 0,
+                "exec_all_ranks": True,
+            }
+        ]
+        # And the response is the fully-unpacked tensor (not a SHM handle dict).
+        assert len(responses) == 1
+        assert isinstance(responses[0], DiffusionOutput)
+        assert isinstance(responses[0].output, torch.Tensor)
+        torch.testing.assert_close(responses[0].output, tensor)
 
 
 @pytest.mark.cpu

@@ -272,10 +272,16 @@ class MultiprocDiffusionExecutor(DiffusionExecutor):
             self._broadcast_mq.enqueue(rpc_request)
             response = self._result_mq.dequeue()
 
-            try:
-                unpack_diffusion_output_shm(response)
-            except Exception as e:
-                logger.warning("SHM unpack failed (data may already be inline): %s", e)
+            # Worker packs large tensors into SHM via pack_diffusion_output_shm
+            # before returning. We must reconstruct them here — this is the
+            # production main path now that worker_postprocess_func runs RIFE
+            # + uint8 conversion inline. Swallowing this exception would leave
+            # ``DiffusionOutput.output`` as ``{"__tensor_shm__": ...}`` and
+            # the SHM segment leaked; fail-fast surfaces protocol mismatches
+            # at the closest possible call site. The helper is a no-op for
+            # any non-SHM-packed payload so it never legitimately fails on
+            # inline responses.
+            unpack_diffusion_output_shm(response)
 
             if isinstance(response, dict) and response.get("status") == "error":
                 raise RuntimeError(
@@ -381,10 +387,11 @@ class MultiprocDiffusionExecutor(DiffusionExecutor):
             for _ in range(num_responses):
                 response = self._dequeue_one_with_failure_polling(deadline, method)
 
-                try:
-                    unpack_diffusion_output_shm(response)
-                except Exception as e:
-                    logger.warning("SHM unpack failed (data may already be inline): %s", e)
+                # Same SHM unpack protocol as the generate path: worker packs
+                # large tensors into SHM, we reconstruct them here. fail-fast
+                # because the inline RIFE / NPU uint8 fast paths produce SHM
+                # packed payloads on every call.
+                unpack_diffusion_output_shm(response)
 
                 # Check if response indicates an error
                 if isinstance(response, dict) and response.get("status") == "error":
